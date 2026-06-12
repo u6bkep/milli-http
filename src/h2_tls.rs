@@ -548,6 +548,10 @@ where
         H2TlsServer::feed_data(self, data)
     }
 
+    fn tcp_feed_data_timed(&mut self, data: &[u8], now: u64) -> Result<(), Error> {
+        H2TlsServer::feed_data_timed(self, data, now)
+    }
+
     fn tcp_poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
         H2TlsServer::poll_output(self, buf)
     }

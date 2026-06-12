@@ -474,7 +474,7 @@ where
                 // final handshake message (common with TLS 1.3 piggybacking).
                 // Feeding an empty slice triggers processing of the decrypted
                 // plaintext already sitting in net_recv's visible prefix.
-                let _ = http_conn.tcp_feed_data(&[]);
+                let _ = http_conn.tcp_feed_data_timed(&[], now);
 
                 conn.state = TcpState::Established(http_conn);
                 conn.protocol = protocol;
@@ -485,10 +485,12 @@ where
             Ok(())
         } else {
             match &mut conn.state {
-                TcpState::Established(http) => {
-                    let _ = now;
-                    http.tcp_feed_data(data)
-                }
+                // Timed feed so the connection's activity clock tracks real
+                // traffic — `handle_tcp_timeouts` drives the HTTP-level idle
+                // timers with the same clock, and an untimed feed would leave
+                // `last_activity` frozen at 0 (any configured idle timeout
+                // fires on the first check regardless of traffic).
+                TcpState::Established(http) => http.tcp_feed_data_timed(data, now),
                 _ => Err(Error::InvalidState),
             }
         }

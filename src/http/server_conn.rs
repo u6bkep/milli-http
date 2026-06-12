@@ -78,6 +78,16 @@ pub trait HttpServerConn {
     /// H3 connections should return `Ok(())` (they use UDP via the manager).
     fn tcp_feed_data(&mut self, data: &[u8]) -> Result<(), Error>;
 
+    /// Feed encrypted TCP data with a timestamp, updating the connection's
+    /// activity clock so idle timeouts measure real idleness. The manager
+    /// always feeds through this method; without an override the timestamp is
+    /// dropped and `handle_timeout`'s idle deadline never rearms — i.e. a
+    /// configured idle timeout would fire regardless of traffic.
+    fn tcp_feed_data_timed(&mut self, data: &[u8], now: u64) -> Result<(), Error> {
+        let _ = now;
+        self.tcp_feed_data(data)
+    }
+
     /// Pull outgoing encrypted TCP data.
     ///
     /// Only meaningful for TCP-based connections.
