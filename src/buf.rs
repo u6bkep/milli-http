@@ -272,6 +272,17 @@ impl<const N: usize> Buf<N> {
         N
     }
 
+    /// Bytes currently backing this buffer: the heap allocation's capacity,
+    /// or the whole static slice. Distinct from [`capacity`](Self::capacity),
+    /// which is the `N` bound. For sizing and tests.
+    #[inline]
+    pub fn allocated_capacity(&self) -> usize {
+        match &self.storage {
+            Storage::Heap(v) => v.capacity(),
+            Storage::Static { mem, .. } => mem.len(),
+        }
+    }
+
     /// Release unused heap capacity. No-op for the `Static` variant.
     #[inline]
     pub fn shrink_to_fit(&mut self) {

@@ -58,9 +58,23 @@ where
         secret: [u8; 32],
         random: [u8; 32],
     ) -> Self {
+        let mut net_recv = Buf::new();
+        // Reserve the receive buffer to its cap up front. A server's receive
+        // buffer fills to a whole record on any real upload, and growing it
+        // there by doubling (`reserve_clamped`: 8 → 16 → 18 KiB) holds the
+        // old and new blocks together across the last step — a transient of
+        // one extra buffer's worth on a heap that is sized for its peak
+        // (main module, 2026-09-17: 65 KB steady during an h2-TLS OTA, ~81 KB
+        // instantaneous, and that 16 KB is what forced the heap sizing).
+        // One allocation at accept costs nothing extra at the peak and
+        // removes the transient. Fallible: under pressure the buffer simply
+        // grows lazily as before. The send buffers stay lazy — a server's
+        // responses rarely approach the cap.
+        #[cfg(feature = "alloc")]
+        let _ = net_recv.try_reserve(BUF);
         Self {
             tls: TlsConnection::new_server(provider, config, secret, random),
-            net_recv: Buf::new(),
+            net_recv,
             net_send: Buf::new(),
             app_send: Buf::new(),
         }
@@ -148,5 +162,35 @@ where
     /// Get the negotiated ALPN protocol (available after handshake).
     pub fn alpn(&self) -> Option<&[u8]> {
         self.tls.alpn()
+    }
+}
+
+#[cfg(all(test, feature = "alloc", feature = "rustcrypto-aes"))]
+mod reserve_tests {
+    use super::*;
+    use crate::crypto::rustcrypto::Aes128GcmProvider;
+    use crate::tls::handshake::ServerTlsConfig;
+
+    /// The server's receive buffer is allocated to its cap at accept, so the
+    /// first full-size record never triggers a doubling reallocation; the
+    /// send buffers stay lazy.
+    #[test]
+    fn server_parts_prereserve_the_receive_buffer() {
+        let config = ServerTlsConfig {
+            cert_der: &[],
+            private_key_der: &[0u8; 32],
+            alpn_protocols: &[b"h2"],
+            transport_params: crate::tls::transport_params::TransportParams::default_params(),
+        };
+        let parts: TlsParts<Aes128GcmProvider, 18432> =
+            TlsParts::new_server(Aes128GcmProvider, config, [0u8; 32], [0u8; 32]);
+        assert!(
+            parts.net_recv.allocated_capacity() >= 18432,
+            "{}",
+            parts.net_recv.capacity()
+        );
+        assert!(parts.net_recv.is_empty());
+        assert_eq!(parts.net_send.allocated_capacity(), 0);
+        assert_eq!(parts.app_send.allocated_capacity(), 0);
     }
 }
