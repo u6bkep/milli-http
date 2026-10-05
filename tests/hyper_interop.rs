@@ -51,6 +51,20 @@ struct StdStream {
     inner: std::net::TcpStream,
     /// Seeded RNG clamping read sizes (segmentation sweep).
     rng: StdRng,
+    /// `poll_shutdown` ran. A stream dropped without it is closed the way
+    /// an embedded stack closes a socket it removes from its set: queued
+    /// data discarded, no FIN — here, SO_LINGER 0 (RST on close) — so a
+    /// test can tell an orderly close from a drop.
+    shut_down: bool,
+}
+
+impl Drop for StdStream {
+    fn drop(&mut self) {
+        if !self.shut_down {
+            let sock = socket2::SockRef::from(&self.inner);
+            let _ = sock.set_linger(Some(std::time::Duration::ZERO));
+        }
+    }
 }
 
 impl MilliTcpStream for StdStream {
@@ -86,6 +100,13 @@ impl MilliTcpStream for StdStream {
             Err(e) => Poll::Ready(Err(e)),
         }
     }
+
+    fn poll_shutdown(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // The kernel sends the FIN after the queued data; the stream is
+        // dropped (closed) once the runner sees Ready.
+        self.shut_down = true;
+        Poll::Ready(self.inner.shutdown(std::net::Shutdown::Write).or(Ok(())))
+    }
 }
 
 impl TcpAccept for StdListener {
@@ -101,6 +122,7 @@ impl TcpAccept for StdListener {
                 Poll::Ready(Ok(StdStream {
                     inner: s,
                     rng: StdRng::seed_from_u64(self.seed ^ self.next_conn),
+                    shut_down: false,
                 }))
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Poll::Pending,
@@ -198,7 +220,13 @@ fn send_response(manager: &mut Mgr, conn: ConnId, stream_id: u64, status: u16, b
     }
 }
 
-fn server_thread(listener: std::net::TcpListener, seed: u64, stop: Arc<AtomicBool>) {
+fn server_thread(
+    listener: std::net::TcpListener,
+    cleartext: Option<std::net::TcpListener>,
+    seed: u64,
+    stop: Arc<AtomicBool>,
+    idle_timeout_us: Option<u64>,
+) {
     let cert_seed: [u8; 32] = [0x42u8; 32];
     let pk = ed25519_public_key_from_seed(&cert_seed);
     let mut cert_buf = [0u8; 512];
@@ -216,6 +244,10 @@ fn server_thread(listener: std::net::TcpListener, seed: u64, stop: Arc<AtomicBoo
         max_tcp_conns: 3,
         max_events: 8,
         handshake_timeout_us: 10_000_000,
+        http_timeouts: milli_http::http::TimeoutConfig {
+            idle_timeout_us,
+            ..ServerConfig::default().http_timeouts
+        },
         ..ServerConfig::default()
     };
     let manager: Mgr = ServerManager::new(Aes128GcmProvider, tls_config, server_config);
@@ -226,6 +258,14 @@ fn server_thread(listener: std::net::TcpListener, seed: u64, stop: Arc<AtomicBoo
         seed,
         next_conn: 0,
     };
+    let mut cleartext_listener = cleartext.map(|l| {
+        l.set_nonblocking(true).unwrap();
+        StdListener {
+            inner: l,
+            seed: seed ^ 0x5a5a,
+            next_conn: 0,
+        }
+    });
     let mut rng = StdMilliRng(StdRng::seed_from_u64(seed));
     // The h3 feature changes ServerRunner::new's shape (UDP socket + QUIC
     // handshake pool); this bench is TCP-only either way.
@@ -238,14 +278,18 @@ fn server_thread(listener: std::net::TcpListener, seed: u64, stop: Arc<AtomicBoo
     let mut runner: Runner<'_> = ServerRunner::new(
         manager,
         Some(&mut tls_listener),
-        None,
+        cleartext_listener.as_mut(),
         &mut udp,
         &mut rng,
         &mut pool,
     );
     #[cfg(not(feature = "h3"))]
-    let mut runner: Runner<'_> =
-        ServerRunner::new(manager, Some(&mut tls_listener), None, &mut rng);
+    let mut runner: Runner<'_> = ServerRunner::new(
+        manager,
+        Some(&mut tls_listener),
+        cleartext_listener.as_mut(),
+        &mut rng,
+    );
 
     let mut pending: Option<PendingRequest> = None;
     let start = Instant::now();
@@ -432,6 +476,24 @@ mod client {
         send
     }
 
+    /// Like [`connect`], but hands back the connection driver so a test can
+    /// observe the server ending the connection.
+    pub async fn connect_with_driver(
+        tls: &TlsConnector,
+        port: u16,
+    ) -> (SendReq, tokio::task::JoinHandle<Result<(), hyper::Error>>) {
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("tcp connect");
+        tcp.set_nodelay(true).unwrap();
+        let name = rustls::pki_types::ServerName::from(std::net::IpAddr::from([127, 0, 0, 1]));
+        let tls_stream = tls.connect(name, tcp).await.expect("tls connect");
+        let (send, conn) = http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream))
+            .await
+            .expect("h2 handshake");
+        (send, tokio::spawn(conn))
+    }
+
     pub async fn request(
         send: &mut SendReq,
         method: &str,
@@ -471,21 +533,32 @@ const GET_PATHS: [&str; 8] = [
 
 struct TestServer {
     port: u16,
+    /// Cleartext HTTP/1.1 listener, for tests that need a raw TCP client.
+    cleartext_port: u16,
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl TestServer {
     fn start(seed: u64) -> Self {
+        Self::start_with_idle_timeout(seed, None)
+    }
+
+    fn start_with_idle_timeout(seed: u64, idle_timeout_us: Option<u64>) -> Self {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
         let port = listener.local_addr().unwrap().port();
+        let cleartext = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let cleartext_port = cleartext.local_addr().unwrap().port();
         let stop = Arc::new(AtomicBool::new(false));
         let handle = {
             let stop = stop.clone();
-            std::thread::spawn(move || server_thread(listener, seed, stop))
+            std::thread::spawn(move || {
+                server_thread(listener, Some(cleartext), seed, stop, idle_timeout_us)
+            })
         };
         Self {
             port,
+            cleartext_port,
             stop,
             handle: Some(handle),
         }
@@ -579,6 +652,84 @@ fn fresh_connections_settings_race() {
             )
             .await;
             assert_eq!(put, Ok(204), "iter {iter}: fresh-conn PUT");
+        }
+    });
+}
+
+/// A server-initiated close must reach the peer as an orderly FIN. A raw
+/// HTTP/1.1 client makes one request and then only listens: after the idle
+/// timeout its read must return EOF (the FIN), not a reset — the runner
+/// lingers on the closed stream until `poll_shutdown` resolves instead of
+/// dropping it (which the test transport turns into an RST, as an embedded
+/// stack turns it into silence).
+#[test]
+fn idle_close_sends_fin_to_a_silent_client() {
+    let server = TestServer::start_with_idle_timeout(8, Some(1_000_000));
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", server.cleartext_port)).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    s.write_all(b"GET /res/a HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    let (mut hdr_end, mut clen) = (None, None);
+    loop {
+        let n = s.read(&mut chunk).expect("response");
+        assert!(n > 0, "connection ended before the response");
+        buf.extend_from_slice(&chunk[..n]);
+        if hdr_end.is_none()
+            && let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+        {
+            hdr_end = Some(p + 4);
+            let hdr = std::str::from_utf8(&buf[..p]).unwrap();
+            assert!(hdr.starts_with("HTTP/1.1 200"), "got {hdr}");
+            clen = hdr
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length: "))
+                .map(|v| v.trim().parse::<usize>().unwrap());
+        }
+        if let (Some(h), Some(c)) = (hdr_end, clen)
+            && buf.len() >= h + c
+        {
+            break;
+        }
+    }
+    // Idle from here. The next read is the close itself.
+    let t0 = Instant::now();
+    match s.read(&mut chunk) {
+        Ok(0) => {}
+        other => panic!("expected EOF (FIN) after the idle timeout, got {other:?}"),
+    }
+    let waited = t0.elapsed();
+    assert!(
+        waited >= std::time::Duration::from_millis(900),
+        "closed too early: {waited:?}"
+    );
+}
+
+/// Same over h2-TLS: a hyper client sees the GOAWAY-then-FIN as a graceful
+/// end of its connection driver.
+#[test]
+fn idle_close_is_delivered_to_a_silent_client() {
+    let server = TestServer::start_with_idle_timeout(7, Some(1_000_000));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let tls = client::tls_connector();
+        let (mut send, driver) = client::connect_with_driver(&tls, server.port).await;
+        let get = client::request(&mut send, "GET", "/res/a", None, server.port).await;
+        assert_eq!(get, Ok(200));
+        // The driver resolves with Ok when the server's GOAWAY and FIN
+        // arrive in order (a graceful h2 shutdown). A stream dropped with
+        // them still queued (the old behaviour) resets instead: the driver
+        // fails, or never resolves at all.
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), driver).await;
+        match ended {
+            Ok(Ok(Ok(()))) => {}
+            other => panic!("expected a graceful close, got {other:?}"),
         }
     });
 }

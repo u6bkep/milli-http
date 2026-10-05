@@ -636,6 +636,7 @@ dependencies = [
  "rand",
  "rustls",
  "sha2",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "x25519-dalek",

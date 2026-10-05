@@ -50,6 +50,26 @@ pub trait TcpStream {
 
     /// Attempt to write data. Registers waker if `Poll::Pending`.
     fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Self::Error>>;
+
+    /// Attempt an orderly close of the write half: send everything written
+    /// so far, then FIN, and resolve once the peer has acknowledged it.
+    /// Registers waker if `Poll::Pending`. Idempotent: the runner polls it
+    /// repeatedly after it decides to close a connection, and drops the
+    /// stream only once this resolves (or its linger cap expires).
+    ///
+    /// The default resolves immediately for transports whose drop already
+    /// closes cleanly (a kernel socket). A transport whose drop discards
+    /// unsent data (an embedded stack removing the socket from its set)
+    /// must implement this, or the peer never learns the connection ended.
+    fn poll_shutdown(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    /// Forcibly close: discard unsent data and reset the connection. Called
+    /// when an orderly [`poll_shutdown`](Self::poll_shutdown) does not
+    /// resolve within the runner's linger cap; `poll_shutdown` is polled a
+    /// little longer afterwards so the reset itself can go out.
+    fn abort(&mut self) {}
 }
 
 /// Poll-based TCP listener.

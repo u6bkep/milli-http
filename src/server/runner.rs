@@ -28,6 +28,32 @@ struct TcpConnState<S> {
     eof: bool,
 }
 
+/// A connection the manager has closed, lingering until its stream has
+/// delivered everything queued for it and shut down (RFC 9293 §3.6: a
+/// close means "I have no more data to send", and the FIN follows the data).
+/// The stream — and whatever transport resource it pins, such as a buffer
+/// slot — is dropped only when the shutdown resolves or the linger cap
+/// expires.
+struct ClosingConn<S> {
+    stream: S,
+    /// Output pulled from the manager before it closed (GOAWAY, the tail of
+    /// a response) that the socket had not yet accepted.
+    pending_write: Vec<u8>,
+    write_offset: usize,
+    /// `now` at which the close began.
+    started: u64,
+    /// The orderly shutdown overran [`SHUTDOWN_LINGER_US`] and the stream was
+    /// told to abort; a shorter window follows for the reset to go out.
+    aborted: bool,
+}
+
+/// How long a closed connection may linger waiting for its queued output
+/// and FIN to be acknowledged before it is reset instead. One RTT in the
+/// normal case; the cap only matters for a peer that stopped responding.
+const SHUTDOWN_LINGER_US: u64 = 5_000_000;
+/// After an abort, how long the stream is polled so the reset can go out.
+const ABORT_LINGER_US: u64 = 1_000_000;
+
 /// Pending UDP transmit that couldn't be sent due to backpressure.
 #[cfg(feature = "h3")]
 struct PendingUdpTx<A> {
@@ -76,6 +102,7 @@ pub struct ServerRunner<
     #[cfg(feature = "h3")]
     pool: &'a mut dyn HandshakePoolAccess<C, CRYPTO_BUF>,
     tcp_conns: Vec<TcpConnState<L::Stream>>,
+    closing: Vec<ClosingConn<L::Stream>>,
     #[cfg(feature = "h3")]
     pending_udp_tx: Option<PendingUdpTx<A>>,
     /// Datagrams rejected by `ServerManager::udp_feed` (malformed, conn limit,
@@ -161,6 +188,7 @@ where
             rng,
             pool,
             tcp_conns: Vec::new(),
+            closing: Vec::new(),
             pending_udp_tx: None,
             udp_feed_errors: 0,
             udp_send_errors: 0,
@@ -197,6 +225,7 @@ where
             cleartext_listener,
             rng,
             tcp_conns: Vec::new(),
+            closing: Vec::new(),
             udp_feed_errors: 0,
             udp_send_errors: 0,
             _udp: core::marker::PhantomData,
@@ -224,6 +253,53 @@ where
     /// work), not merely because input was consumed.
     pub fn poll_event(&mut self, cx: &mut Context<'_>, now: u64) -> Poll<ServerEvent> {
         let mut has_pending_output = false;
+
+        // 0. Finish closing connections. Before the accepts: a stream dropped
+        //    here may free the transport resource (a buffer slot) the
+        //    listener needs, and the wake that completed its shutdown is the
+        //    only wake coming.
+        self.closing.retain_mut(|c| {
+            while c.write_offset < c.pending_write.len() {
+                match c.stream.poll_write(cx, &c.pending_write[c.write_offset..]) {
+                    Poll::Ready(Ok(n)) => c.write_offset += n,
+                    // A write error means the peer is gone; nothing left to
+                    // deliver and nothing to wait for.
+                    Poll::Ready(Err(_)) => return false,
+                    Poll::Pending => break,
+                }
+            }
+            if c.write_offset < c.pending_write.len() && !c.aborted {
+                if now.saturating_sub(c.started) < SHUTDOWN_LINGER_US {
+                    return true;
+                }
+                // The peer is not taking our output: give up on it.
+                c.stream.abort();
+                c.aborted = true;
+                c.started = now;
+                c.pending_write.clear();
+                c.write_offset = 0;
+            }
+            match c.stream.poll_shutdown(cx) {
+                Poll::Ready(_) => false,
+                Poll::Pending => {
+                    let linger = if c.aborted {
+                        ABORT_LINGER_US
+                    } else {
+                        SHUTDOWN_LINGER_US
+                    };
+                    if now.saturating_sub(c.started) < linger {
+                        return true;
+                    }
+                    if c.aborted {
+                        return false;
+                    }
+                    c.stream.abort();
+                    c.aborted = true;
+                    c.started = now;
+                    true
+                }
+            }
+        });
 
         // 1. Accept new TCP connections from each listener (at most one per
         //    listener per cycle to avoid starving established connections).
@@ -491,8 +567,23 @@ where
         // 7. Drain manager events
         let mut scratch = [0u8; 2048];
         if let Some(event) = self.manager.poll_event(&mut scratch) {
-            if let ServerEvent::Closed(id) = &event {
-                self.tcp_conns.retain(|c| c.id != *id);
+            if let ServerEvent::Closed(id) = &event
+                && let Some(pos) = self.tcp_conns.iter().position(|c| c.id == *id)
+            {
+                // The manager is done with it; the stream still owes the peer
+                // its queued output and a FIN (step 0).
+                let conn = self.tcp_conns.swap_remove(pos);
+                self.closing.push(ClosingConn {
+                    stream: conn.stream,
+                    pending_write: conn.pending_write,
+                    write_offset: conn.write_offset,
+                    started: now,
+                    aborted: false,
+                });
+                // Nothing else wakes us for a shutdown that resolves
+                // immediately (the default impl, a transport with nothing
+                // queued): run step 0 on the next poll regardless.
+                cx.waker().wake_by_ref();
             }
             return Poll::Ready(event);
         }
