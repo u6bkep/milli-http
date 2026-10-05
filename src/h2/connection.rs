@@ -198,6 +198,10 @@ pub struct H2Connection<
     // Timeout support
     timeout_config: crate::http::TimeoutConfig,
     last_activity: u64,
+    /// The application handed this connection bytes to send since the last
+    /// `handle_timeout` tick. Sends have no timestamp of their own; the tick
+    /// folds this into `last_activity` (see `handle_timeout`).
+    sent_since_tick: bool,
     connection_start: u64,
     headers_phase_complete: bool,
     /// A DATA frame whose payload has not fully arrived. Its 9-byte header (and
@@ -298,6 +302,7 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
             goaway_sent: false,
             timeout_config: crate::http::TimeoutConfig::default(),
             last_activity: 0,
+            sent_since_tick: false,
             connection_start: 0,
             headers_phase_complete: false,
             partial_data: None,
@@ -434,6 +439,7 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                 stream.send_end_stream();
             }
         }
+        self.sent_since_tick = true;
 
         Ok(())
     }
@@ -544,6 +550,8 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
         if actual_end && let Some(stream) = self.get_stream_mut(stream_id) {
             stream.send_end_stream();
         }
+        // An empty DATA frame still carries END_STREAM, so count it too.
+        self.sent_since_tick = true;
 
         Ok(to_send.len())
     }
@@ -1563,9 +1571,21 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
 
     /// Check timeouts. If a timeout fires, queues a GOAWAY frame, transitions
     /// to Closed, and emits `H2Event::Timeout`.
+    ///
+    /// Bytes the application sent since the previous tick count as activity
+    /// at `now`: the idle timeout measures a connection with no traffic in
+    /// either direction (RFC 9000 §10.1 restarts the idle timer on sending
+    /// as well as receiving), not a peer that is silent while we stream to
+    /// it. The runner ticks every poll cycle, so the stamp lags the send by
+    /// at most one cycle. A send that never gets accepted (window or send
+    /// buffer exhausted) does not set the flag, so a peer that stops reading
+    /// is still reaped.
     pub fn handle_timeout<const BUF: usize>(&mut self, io: &mut H2Io<'_, BUF>, now: u64) {
         if self.state == H2ConnState::Closed {
             return;
+        }
+        if core::mem::take(&mut self.sent_since_tick) {
+            self.last_activity = now;
         }
 
         if !self.headers_phase_complete {
@@ -2212,6 +2232,11 @@ mod tests {
 
         while let Some(_) = client.poll_event() {}
 
+        // The runner ticks every poll cycle; this tick stamps the response
+        // send at t=0 (sends count as activity, see `handle_timeout`).
+        server.handle_timeout(&mut sio.as_io(), 0);
+        assert!(!server.is_closed());
+
         server.handle_timeout(&mut sio.as_io(), 2_000_000);
 
         let mut got_timeout = false;
@@ -2221,6 +2246,125 @@ mod tests {
             }
         }
         assert!(got_timeout, "server should emit Timeout after idle");
+        assert!(server.is_closed());
+    }
+
+    /// A server streaming a response (SSE) to a client that never sends is
+    /// not idle: each send accepted before a tick restarts the idle clock.
+    /// Once the sends stop, the clock runs out as usual.
+    #[test]
+    fn timeout_idle_restarted_by_server_sends() {
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<32768>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<32768>::new();
+
+        let config = crate::http::TimeoutConfig {
+            idle_timeout_us: Some(1_000_000),
+            header_timeout_us: None,
+        };
+        server.set_timeouts(config, 0);
+
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+
+        let stream_id = client
+            .open_stream(
+                &mut cio.as_io(),
+                &[
+                    (b":method", b"GET"),
+                    (b":path", b"/events"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"example.com"),
+                ],
+                true,
+            )
+            .unwrap();
+        exchange(&mut client, &mut cio, &mut server, &mut sio);
+        while let Some(_) = server.poll_event() {}
+
+        server
+            .send_headers(&mut sio.as_io(), stream_id, &[(b":status", b"200")], false)
+            .unwrap();
+        exchange(&mut server, &mut sio, &mut client, &mut cio);
+        server.handle_timeout(&mut sio.as_io(), 0);
+
+        // One event every 800 ms for 4 s, the client silent throughout.
+        for i in 1..=5u64 {
+            let now = i * 800_000;
+            server
+                .send_data(&mut sio.as_io(), stream_id, b"data: x\n\n", false)
+                .unwrap();
+            exchange(&mut server, &mut sio, &mut client, &mut cio);
+            server.handle_timeout(&mut sio.as_io(), now);
+            assert!(!server.is_closed(), "closed at tick {i} while streaming");
+            while let Some(ev) = server.poll_event() {
+                assert_ne!(ev, H2Event::Timeout, "timeout at tick {i} while streaming");
+            }
+        }
+
+        // The stream goes quiet: 0.9 s after the last send still alive,
+        // 1.0 s after it reaped.
+        server.handle_timeout(&mut sio.as_io(), 4_000_000 + 900_000);
+        assert!(!server.is_closed());
+        server.handle_timeout(&mut sio.as_io(), 4_000_000 + 1_000_000);
+        assert!(server.is_closed());
+        assert!(
+            server
+                .poll_event()
+                .into_iter()
+                .any(|e| e == H2Event::Timeout)
+        );
+    }
+
+    /// A send the connection refuses (stream window exhausted) is not
+    /// activity: a peer that stops reading is still reaped.
+    #[test]
+    fn timeout_refused_send_is_not_activity() {
+        let mut client = H2Connection::<16>::new_client();
+        let mut cio = H2IoBufs::<32768>::new();
+        let mut server = H2Connection::<16>::new_server();
+        let mut sio = H2IoBufs::<32768>::new();
+
+        let config = crate::http::TimeoutConfig {
+            idle_timeout_us: Some(1_000_000),
+            header_timeout_us: None,
+        };
+        server.set_timeouts(config, 0);
+
+        run_handshake(&mut client, &mut cio, &mut server, &mut sio);
+
+        let stream_id = client
+            .open_stream(
+                &mut cio.as_io(),
+                &[
+                    (b":method", b"GET"),
+                    (b":path", b"/"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"example.com"),
+                ],
+                true,
+            )
+            .unwrap();
+        exchange(&mut client, &mut cio, &mut server, &mut sio);
+        while let Some(_) = server.poll_event() {}
+
+        server
+            .send_headers(&mut sio.as_io(), stream_id, &[(b":status", b"200")], false)
+            .unwrap();
+        exchange(&mut server, &mut sio, &mut client, &mut cio);
+        server.handle_timeout(&mut sio.as_io(), 0);
+
+        // Exhaust the stream window without the client ever opening it.
+        if let Some(s) = server.get_stream_mut(stream_id) {
+            s.send_window = 0;
+        }
+        assert_eq!(
+            server.send_data(&mut sio.as_io(), stream_id, b"x", false),
+            Err(Error::WouldBlock)
+        );
+        server.handle_timeout(&mut sio.as_io(), 999_999);
+        assert!(!server.is_closed());
+        server.handle_timeout(&mut sio.as_io(), 1_000_000);
         assert!(server.is_closed());
     }
 

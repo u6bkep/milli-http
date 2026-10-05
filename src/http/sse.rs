@@ -41,6 +41,19 @@ pub fn format_event(event: Option<&str>, data: &str, out: &mut [u8]) -> Result<u
     Ok(off)
 }
 
+/// Format a comment frame (`: <text>` + blank line). Clients ignore
+/// comments; the spec suggests sending one "every 15 seconds or so" so a
+/// stream with no events still carries traffic — proxies and idle timeouts
+/// (including this crate's, which counts sends as activity) would otherwise
+/// reap a quiet stream as dead. `text` must not contain a newline.
+pub fn format_comment(text: &str, out: &mut [u8]) -> Result<usize, Error> {
+    let mut off = 0;
+    put(out, &mut off, b": ")?;
+    put(out, &mut off, text.as_bytes())?;
+    put(out, &mut off, b"\n\n")?;
+    Ok(off)
+}
+
 /// Format a `retry: <ms>` frame, instructing the client how long to wait
 /// before reconnecting after the stream drops.
 pub fn format_retry(retry_ms: u32, out: &mut [u8]) -> Result<usize, Error> {
@@ -75,6 +88,17 @@ fn put(out: &mut [u8], off: &mut usize, bytes: &[u8]) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comment() {
+        let mut buf = [0u8; 64];
+        let n = format_comment("keepalive", &mut buf).unwrap();
+        assert_eq!(&buf[..n], b": keepalive\n\n");
+        assert!(matches!(
+            format_comment("keepalive", &mut [0u8; 4]),
+            Err(Error::BufferTooSmall { .. })
+        ));
+    }
 
     #[test]
     fn named_event() {

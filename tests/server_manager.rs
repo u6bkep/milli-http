@@ -792,6 +792,28 @@ fn tcp_cleartext_http1_request() {
     let text = core::str::from_utf8(&out).unwrap();
     assert!(text.starts_with("HTTP/1.1 200"), "got: {text}");
     assert!(text.ends_with("ok"), "got: {text}");
+
+    // The connection is parked after its response: the default 60 s idle
+    // timeout (armed at accept, like a TLS connection's at handshake) reaps
+    // it. The tick at 1 s stamps the response send; nothing happens for the
+    // next 60 s.
+    let mut pool: HandshakePool<Aes128GcmProvider, 4> = HandshakePool::new();
+    manager.handle_timeouts::<4096>(1_000_000, &mut pool);
+    assert!(
+        manager.next_timeout().is_some(),
+        "cleartext conn has no timers"
+    );
+    manager.handle_timeouts::<4096>(60_999_999, &mut pool);
+    while manager.poll_event(&mut scratch).is_some() {}
+    assert!(manager.tcp_poll_output(conn_id, &mut buf).is_none());
+    manager.handle_timeouts::<4096>(61_000_000, &mut pool);
+    let mut closed = false;
+    while let Some(ev) = manager.poll_event(&mut scratch) {
+        if matches!(ev, ServerEvent::Closed(id) if id == conn_id) {
+            closed = true;
+        }
+    }
+    assert!(closed, "parked cleartext connection was not reaped");
 }
 
 // -----------------------------------------------------------------------

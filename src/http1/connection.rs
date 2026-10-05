@@ -110,6 +110,10 @@ pub struct Http1Connection<const HDRBUF: usize = 2048, const DATABUF: usize = 40
     // Timeout support
     timeout_config: crate::http::TimeoutConfig,
     last_activity: u64,
+    /// The application handed this connection bytes to send since the last
+    /// `handle_timeout` tick; folded into `last_activity` at the tick (see
+    /// `H2Connection::handle_timeout` for the rationale).
+    sent_since_tick: bool,
     connection_start: u64,
     headers_phase_complete: bool,
     closed: bool,
@@ -142,6 +146,7 @@ impl<const HDRBUF: usize, const DATABUF: usize> Http1Connection<HDRBUF, DATABUF>
             connected_emitted: false,
             timeout_config: crate::http::TimeoutConfig::default(),
             last_activity: 0,
+            sent_since_tick: false,
             connection_start: 0,
             headers_phase_complete: false,
             closed: false,
@@ -211,9 +216,11 @@ impl<const HDRBUF: usize, const DATABUF: usize> Http1Connection<HDRBUF, DATABUF>
     ) -> Result<(), Error> {
         self.check_stream_id(stream_id)?;
         match self.role {
-            Role::Client => self.encode_request(io, headers, end_stream),
-            Role::Server => self.encode_response(io, headers, end_stream),
+            Role::Client => self.encode_request(io, headers, end_stream)?,
+            Role::Server => self.encode_response(io, headers, end_stream)?,
         }
+        self.sent_since_tick = true;
+        Ok(())
     }
 
     /// Send body data.
@@ -226,6 +233,9 @@ impl<const HDRBUF: usize, const DATABUF: usize> Http1Connection<HDRBUF, DATABUF>
     ) -> Result<usize, Error> {
         self.check_stream_id(stream_id)?;
         io.queue_send(data)?;
+        if !data.is_empty() {
+            self.sent_since_tick = true;
+        }
         Ok(data.len())
     }
 
@@ -344,9 +354,17 @@ impl<const HDRBUF: usize, const DATABUF: usize> Http1Connection<HDRBUF, DATABUF>
 
     /// Check timeouts. If a timeout fires, sets `closed = true` and emits
     /// `Http1Event::Timeout`.
+    ///
+    /// Bytes sent since the previous tick count as activity at `now` — the
+    /// idle timeout measures silence in both directions, so a streaming
+    /// response (SSE) to a peer that never sends is not "idle" while it
+    /// makes progress. See `H2Connection::handle_timeout`.
     pub fn handle_timeout(&mut self, now: u64) {
         if self.closed {
             return;
+        }
+        if core::mem::take(&mut self.sent_since_tick) {
+            self.last_activity = now;
         }
 
         // Header timeout: fires if headers phase not complete
@@ -1803,6 +1821,62 @@ mod tests {
             }
         }
         assert!(got_timeout);
+    }
+
+    /// A streamed response (SSE) to a client that never sends after its
+    /// request is not idle: sends accepted before a tick restart the clock.
+    /// A parked keep-alive connection (response done, nothing either way)
+    /// is reaped once the clock runs out.
+    #[test]
+    fn idle_timeout_restarted_by_server_sends() {
+        let mut conn = Http1Connection::<1024, 1024>::new_server();
+        let mut io = Http1IoBufs::<4096>::new();
+        let config = crate::http::TimeoutConfig {
+            idle_timeout_us: Some(1_000_000),
+            header_timeout_us: None,
+        };
+        conn.set_timeouts(config, 0);
+
+        conn.feed_data_timed(
+            &mut io.as_io(),
+            b"GET /events HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            0,
+        )
+        .unwrap();
+        while conn.poll_event().is_some() {}
+        conn.recv_headers(1, |_, _| {}).unwrap();
+
+        conn.send_headers(
+            &mut io.as_io(),
+            1,
+            &[
+                (b":status", b"200"),
+                (b"content-type", b"text/event-stream"),
+            ],
+            false,
+        )
+        .unwrap();
+        conn.handle_timeout(0);
+
+        let mut out = [0u8; 256];
+        for i in 1..=5u64 {
+            let now = i * 800_000;
+            conn.send_data(&mut io.as_io(), 1, b"data: x\n\n", false)
+                .unwrap();
+            while conn.poll_output(&mut io.as_io(), &mut out).is_some() {}
+            conn.handle_timeout(now);
+            assert!(!conn.is_closed(), "closed at tick {i} while streaming");
+        }
+
+        conn.handle_timeout(4_000_000 + 999_999);
+        assert!(!conn.is_closed());
+        conn.handle_timeout(4_000_000 + 1_000_000);
+        assert!(conn.is_closed());
+        assert!(
+            conn.poll_event()
+                .into_iter()
+                .any(|e| e == Http1Event::Timeout)
+        );
     }
 
     #[test]

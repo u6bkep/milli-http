@@ -401,7 +401,11 @@ where
         }
         let id = self.alloc_id();
 
-        let http_conn: Box<dyn HttpServerConn> = Box::new(crate::http1::Http1Server::<BUF>::new());
+        let mut http_conn: Box<dyn HttpServerConn> =
+            Box::new(crate::http1::Http1Server::<BUF>::new());
+        // Same HTTP-level timeouts as a TLS connection gets at handshake
+        // completion; without this a cleartext connection has none at all.
+        http_conn.set_timeouts(self.config.http_timeouts, now);
         self.tcp_conns.push(TcpConn {
             id,
             state: TcpState::Established(http_conn),
