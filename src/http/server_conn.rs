@@ -124,9 +124,14 @@ pub trait HttpServerConn {
     /// for it (apply TCP-window backpressure) and instead re-drive processing
     /// (feed an empty slice) so the consumer can drain and the pump resumes.
     ///
-    /// Default `false`: connections without internal receive backpressure
-    /// (e.g. HTTP/1.1, where the socket RX buffer is the backpressure point)
-    /// are always read.
+    /// Every TCP-based connection type must implement this when it can park
+    /// body bytes behind an application buffer: HTTP/1.1 parks them in its
+    /// `recv_buf` behind `data_buf`, and once the peer has sent the whole
+    /// body no further TCP read will ever re-drive the parser — only the
+    /// runner's empty re-feed does (seen as a permanent stall of a 12 KB
+    /// upload into a paced consumer, and a `BufferTooSmall` teardown above
+    /// `BUF`). Default `false` is only right for connections that never
+    /// buffer undelivered input (H3 over UDP).
     fn recv_blocked(&self) -> bool {
         false
     }

@@ -352,7 +352,15 @@ where
                     conn.eof = true;
                     self.manager.tcp_eof(conn.id);
                 }
-                has_pending_output = true;
+                // Self-wake only when the re-drive changed something. Bytes
+                // it moved are announced as Data events, which the server
+                // loop handles (and the consumer's drain re-enters this poll)
+                // — spinning here while the consumer paces a body (an audio
+                // stream draining at playback rate) would pin the core for
+                // the whole body.
+                if !self.manager.conn_recv_blocked(conn.id) {
+                    has_pending_output = true;
+                }
                 continue;
             }
             let mut reads_done = 0u32;

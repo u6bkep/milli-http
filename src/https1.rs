@@ -532,6 +532,14 @@ where
         Https1Server::poll_output(self, buf)
     }
 
+    fn recv_blocked(&self) -> bool {
+        // Same condition as the cleartext `Http1Server`: decrypted body
+        // bytes parked in `net_recv`'s plaintext prefix behind a full
+        // `data_buf`. The runner re-drives `feed_data(&[])`, which the TLS
+        // layer passes through to the HTTP parser.
+        self.http.body_parked() && !self.net_recv.is_empty()
+    }
+
     fn reclaim_buffers(&mut self) -> Option<crate::tcp_tls::TlsBufKit> {
         // Recover the three I/O buffers' `'static` slices only if all three
         // are static-backed (they are constructed uniformly via `from_parts`).
