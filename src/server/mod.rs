@@ -63,6 +63,38 @@ pub enum ServerEvent {
     Closed(ConnId),
 }
 
+/// Why the manager closed a connection — the post-mortem a bare
+/// [`ServerEvent::Closed`] cannot give. Recorded at every close site and
+/// read back with [`ServerManager::take_close_reason`] when the event is
+/// handled; the runner notes its transport-level causes before calling
+/// [`ServerManager::tcp_eof`], which otherwise records [`CloseReason::PeerEof`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseReason {
+    /// The TLS handshake failed on inbound data.
+    HandshakeError(Error),
+    /// The handshake completed with an ALPN this build does not serve.
+    UnsupportedAlpn,
+    /// The HTTP layer closed itself (peer alert or GOAWAY, protocol error,
+    /// idle or first-headers timeout).
+    HttpClosed,
+    /// The TLS handshake did not complete in time.
+    HandshakeTimeout,
+    /// The peer sent FIN (TCP read returned 0).
+    PeerEof,
+    /// Inbound bytes were refused by the connection (buffer or protocol
+    /// error on `tcp_feed`); nothing is sent to the peer in this case.
+    FeedError(Error),
+    /// The transport read failed (reset by peer, socket error).
+    ReadError,
+    /// The transport write failed.
+    WriteError,
+    /// The application asked for the close.
+    AppClose,
+}
+
+/// Close reasons retained for not-yet-handled `Closed` events.
+const CLOSE_REASONS_KEPT: usize = 8;
+
 // ---------------------------------------------------------------------------
 // TCP connection state
 // ---------------------------------------------------------------------------
@@ -231,6 +263,9 @@ pub struct ServerManager<
     /// connections fall back to heap-backed buffers (std tests, non-firmware
     /// users).
     free_kits: Vec<crate::tcp_tls::TlsBufKit>,
+    /// See [`CloseReason`]: one entry per closed connection whose `Closed`
+    /// event has not been read back yet (bounded; oldest dropped).
+    close_reasons: Vec<(ConnId, CloseReason)>,
     _marker: core::marker::PhantomData<A>,
 }
 
@@ -275,6 +310,7 @@ where
             events: VecDeque::new(),
             next_id: 0,
             free_kits: Vec::new(),
+            close_reasons: Vec::new(),
             _marker: core::marker::PhantomData,
         }
     }
@@ -341,6 +377,26 @@ where
             let _ = self.events.pop_front();
         }
         self.events.push_back(event);
+    }
+
+    /// Record why `id` is being closed. The first reason noted for a
+    /// connection wins (the runner's transport-level cause precedes the
+    /// manager's generic one), so this is a no-op if one is already held.
+    pub fn note_close_reason(&mut self, id: ConnId, reason: CloseReason) {
+        if self.close_reasons.iter().any(|(c, _)| *c == id) {
+            return;
+        }
+        if self.close_reasons.len() >= CLOSE_REASONS_KEPT {
+            self.close_reasons.remove(0);
+        }
+        self.close_reasons.push((id, reason));
+    }
+
+    /// The reason recorded for a closed connection, removed on read. `None`
+    /// if the close was never attributed (or the entry was evicted).
+    pub fn take_close_reason(&mut self, id: ConnId) -> Option<CloseReason> {
+        let i = self.close_reasons.iter().position(|(c, _)| *c == id)?;
+        Some(self.close_reasons.remove(i).1)
     }
 
     /// Accept a new TCP connection. Creates TLS handshake state.
@@ -437,6 +493,7 @@ where
                     if let Some(kit) = Self::reclaim_and_close(&mut conn.state) {
                         self.free_kits.push(kit);
                     }
+                    self.note_close_reason(conn_id, CloseReason::HandshakeError(e));
                     self.push_server_event(ServerEvent::Closed(conn_id));
                     return Err(e);
                 }
@@ -481,6 +538,7 @@ where
                         if let Some(kit) = parts.reclaim_buffers() {
                             self.free_kits.push(kit);
                         }
+                        self.note_close_reason(conn_id, CloseReason::UnsupportedAlpn);
                         self.push_server_event(ServerEvent::Closed(conn_id));
                         return Err(Error::InvalidState);
                     }
@@ -693,6 +751,7 @@ where
             if let Some(kit) = kit {
                 self.free_kits.push(kit);
             }
+            self.note_close_reason(id, CloseReason::HttpClosed);
             return Some(ServerEvent::Closed(id));
         }
 
@@ -980,6 +1039,7 @@ where
         }
         self.free_kits.append(&mut reclaimed_kits);
         for id in timed_out {
+            self.note_close_reason(id, CloseReason::HandshakeTimeout);
             self.push_server_event(ServerEvent::Closed(id));
         }
     }
@@ -1016,6 +1076,7 @@ where
         for ev in drained {
             self.push_server_event(ev);
         }
+        self.note_close_reason(id, CloseReason::PeerEof);
         self.push_server_event(ServerEvent::Closed(id));
     }
 
@@ -1030,6 +1091,7 @@ where
             if let Some(kit) = reclaimed_kit {
                 self.free_kits.push(kit);
             }
+            self.note_close_reason(id, CloseReason::AppClose);
             self.push_server_event(ServerEvent::Closed(id));
             return Ok(());
         }

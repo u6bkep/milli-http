@@ -14,7 +14,7 @@ use crate::connection::HandshakePoolAccess;
 use crate::crypto::CryptoProvider;
 use crate::transport::{Address, Rng, TcpAccept, TcpStream, UdpSocket};
 
-use super::{ConnId, ServerEvent, ServerManager};
+use super::{CloseReason, ConnId, ServerEvent, ServerManager};
 
 /// Per-connection TCP write state: tracks partially-written data.
 struct TcpConnState<S> {
@@ -348,8 +348,10 @@ where
             // empty feed so the pump resumes once the consumer has drained via
             // recv_body. Self-wake to keep draining until it clears.
             if self.manager.conn_recv_blocked(conn.id) {
-                if self.manager.tcp_feed(conn.id, &[], now).is_err() {
+                if let Err(e) = self.manager.tcp_feed(conn.id, &[], now) {
                     conn.eof = true;
+                    self.manager
+                        .note_close_reason(conn.id, CloseReason::FeedError(e));
                     self.manager.tcp_eof(conn.id);
                 }
                 has_pending_output = true;
@@ -365,7 +367,9 @@ where
                     }
                     Poll::Ready(Ok(n)) => {
                         reads_done += 1;
-                        if self.manager.tcp_feed(conn.id, &tcp_buf[..n], now).is_err() {
+                        if let Err(e) = self.manager.tcp_feed(conn.id, &tcp_buf[..n], now) {
+                            self.manager
+                                .note_close_reason(conn.id, CloseReason::FeedError(e));
                             // Reap the connection like the EOF/read-error arms
                             // do. Without tcp_eof the manager-side conn stays
                             // Established forever: no Closed event, the TcpSlot
@@ -379,6 +383,8 @@ where
                     }
                     Poll::Ready(Err(_)) => {
                         conn.eof = true;
+                        self.manager
+                            .note_close_reason(conn.id, CloseReason::ReadError);
                         self.manager.tcp_eof(conn.id);
                         break;
                     }
@@ -404,6 +410,8 @@ where
                     }
                     Poll::Ready(Err(_)) => {
                         conn.eof = true;
+                        self.manager
+                            .note_close_reason(conn.id, CloseReason::WriteError);
                         self.manager.tcp_eof(conn.id);
                         break;
                     }
@@ -445,6 +453,8 @@ where
                             }
                             Poll::Ready(Err(_)) => {
                                 conn.eof = true;
+                                self.manager
+                                    .note_close_reason(conn.id, CloseReason::WriteError);
                                 self.manager.tcp_eof(conn.id);
                                 break;
                             }
@@ -463,6 +473,8 @@ where
                             // dropping them would corrupt the stream. Treat
                             // allocator exhaustion like a fatal write error.
                             conn.eof = true;
+                            self.manager
+                                .note_close_reason(conn.id, CloseReason::WriteError);
                             self.manager.tcp_eof(conn.id);
                             break;
                         }
