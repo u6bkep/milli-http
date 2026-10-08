@@ -152,6 +152,10 @@ enum H2ConnState {
 /// encoding in the send buffer.
 const HEADERS_SCRATCH: usize = 1024;
 
+/// A DATA chunk at least this large grows the send buffer to its bound at
+/// once (see `send_data`); smaller chunks reserve exactly.
+const LARGE_BODY_CHUNK: usize = 4096;
+
 /// HTTP/2 connection state machine.
 ///
 /// I/O buffers are **not** owned by this struct; callers provide them via
@@ -558,14 +562,21 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                 needed: io.send_buf.len() + total_needed,
             });
         }
-        // A body grows the send buffer to its full bound in one step the
-        // first time it does not fit: amortized doubling from a small
-        // capacity reallocates several times with old and new blocks live
-        // together, a transient peak above the single BUF-sized block
-        // (measured by `h2_tls_peak_heap`). Header-only responses never
-        // reach this and keep their small buffer (see `send_headers`).
+        // A large body chunk grows the send buffer to its full bound in one
+        // step the first time it does not fit: amortized doubling from a
+        // small capacity reallocates several times with old and new blocks
+        // live together, a transient peak above the single BUF-sized block
+        // (measured by `h2_tls_peak_heap`). A small chunk reserves only what
+        // it needs — a short error body must not demand a BUF-sized block
+        // (bench 2026-10-08: a 16-byte 400 body failed that way on a
+        // fragmented heap and the connection was closed under the client).
         if io.send_buf.len() + total_needed > io.send_buf.allocated_capacity() {
-            io.send_buf.buf_try_reserve(BUF - io.send_buf.len())?;
+            let grow = if to_send.len() >= LARGE_BODY_CHUNK {
+                BUF - io.send_buf.len()
+            } else {
+                total_needed
+            };
+            io.send_buf.buf_try_reserve(grow)?;
         }
         let flags = if actual_end { FLAG_END_STREAM } else { 0 };
         let hdr = frame::H2FrameHeader {

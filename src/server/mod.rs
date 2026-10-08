@@ -116,6 +116,9 @@ struct TcpConn<C: CryptoProvider, const BUF: usize> {
     /// Timestamp (microseconds) when the connection was accepted.
     /// Used for handshake timeout enforcement.
     accepted_at: u64,
+    /// The receive buffer held its full `BUF` capacity at accept (see
+    /// [`ServerManager::tls_recv_buffer_reserved`]).
+    recv_reserved: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +402,18 @@ where
         Some(self.close_reasons.remove(i).1)
     }
 
+    /// Whether a TLS connection's receive buffer holds its full `BUF`
+    /// capacity. `TlsParts::new_server` reserves it at accept but cannot
+    /// fail the accept when the allocator has no block that large; such a
+    /// connection then grows the buffer lazily and dies on its first
+    /// full-size record (a fragmented heap looks like plenty of free bytes
+    /// with no hole to fit one). `None` for an unknown or cleartext id.
+    pub fn tls_recv_buffer_reserved(&self, id: ConnId) -> Option<bool> {
+        let conn = self.tcp_conns.iter().find(|c| c.id == id)?;
+        (conn.protocol != ConnProtocol::Http1 || matches!(conn.state, TcpState::Handshaking(_)))
+            .then_some(conn.recv_reserved)
+    }
+
     /// Accept a new TCP connection. Creates TLS handshake state.
     ///
     /// Returns the connection ID, or an error if at capacity.
@@ -434,11 +449,13 @@ where
             ),
         };
 
+        let recv_reserved = parts.net_recv.allocated_capacity() >= BUF;
         self.tcp_conns.push(TcpConn {
             id,
             state: TcpState::Handshaking(parts),
             protocol: ConnProtocol::Handshaking,
             accepted_at: now,
+            recv_reserved,
         });
 
         Ok(id)
@@ -467,6 +484,7 @@ where
             state: TcpState::Established(http_conn),
             protocol: ConnProtocol::Http1,
             accepted_at: now,
+            recv_reserved: true,
         });
         self.push_server_event(ServerEvent::Connected(id));
 
