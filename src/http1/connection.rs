@@ -105,6 +105,12 @@ pub struct Http1Connection<const HDRBUF: usize = 2048, const DATABUF: usize = 40
     keep_alive: bool,
     /// Whether end-of-stream has been signalled for the current message.
     body_finished: bool,
+    /// Body bytes are parked in `recv_buf` because `data_buf` had no room
+    /// for them (or the allocator refused to grow it). Only a drain via
+    /// [`recv_body`](Self::recv_body) followed by a re-drive
+    /// (`feed_data(&[])`) moves them — never a TCP read. See
+    /// [`body_parked`](Self::body_parked).
+    body_parked: bool,
     /// Whether the Connected event has been emitted.
     connected_emitted: bool,
     // Timeout support
@@ -143,6 +149,7 @@ impl<const HDRBUF: usize, const DATABUF: usize> Http1Connection<HDRBUF, DATABUF>
             chunk_state: ChunkState::Size,
             keep_alive: true,
             body_finished: false,
+            body_parked: false,
             connected_emitted: false,
             timeout_config: crate::http::TimeoutConfig::default(),
             last_activity: 0,
@@ -282,6 +289,24 @@ impl<const HDRBUF: usize, const DATABUF: usize> Http1Connection<HDRBUF, DATABUF>
         self.header_buf.clear();
         self.headers_available = false;
         Ok(())
+    }
+
+    /// Whether body bytes are parked in `recv_buf` for lack of room in
+    /// `data_buf`. This is the HTTP/1.1 receive-backpressure condition (see
+    /// `HttpServerConn::recv_blocked`): the parked bytes need the
+    /// application to drain via [`recv_body`](Self::recv_body) and then a
+    /// re-drive (`feed_data(&[])`) — a TCP read is neither needed nor, once
+    /// the peer has sent the whole body, ever coming. It stays set while
+    /// *any* body byte is parked, not only while `data_buf` is full: after
+    /// a partial drain the parked tail still has to be re-driven, or a body
+    /// that outgrows `data_buf` + the consumer's own buffering stalls for
+    /// good (seen with a 12 KB upload into a paced audio consumer).
+    ///
+    /// False whenever the parser is waiting on the *network* (an incomplete
+    /// chunk-size line, a body not fully received yet), so the runner keeps
+    /// reading the socket in those cases.
+    pub fn body_parked(&self) -> bool {
+        self.body_parked
     }
 
     /// Read received body data.
@@ -710,11 +735,14 @@ impl<const HDRBUF: usize, const DATABUF: usize> Http1Connection<HDRBUF, DATABUF>
             if self.data_buf.buf_try_reserve(can_store).is_err() {
                 // Allocator pressure: leave the bytes in recv_buf; progress
                 // resumes on the next feed (same as a full data_buf).
+                self.body_parked = true;
                 return Ok(false);
             }
             let _ = self.data_buf.extend_from_slice(&io.recv_buf[..can_store]);
             io.drain_recv(can_store);
             let new_remaining = remaining - can_store;
+            // Whatever did not fit stays parked behind data_buf.
+            self.body_parked = can_store < to_consume;
 
             let sid = self.current_stream_id;
             let _ = self.events.push_back(Http1Event::Data(sid));
@@ -730,6 +758,8 @@ impl<const HDRBUF: usize, const DATABUF: usize> Http1Connection<HDRBUF, DATABUF>
             }
             Ok(true)
         } else {
+            // Body bytes are waiting but data_buf is full.
+            self.body_parked = true;
             Ok(false)
         }
     }
@@ -767,11 +797,13 @@ impl<const HDRBUF: usize, const DATABUF: usize> Http1Connection<HDRBUF, DATABUF>
                         // Allocator pressure: leave the bytes in recv_buf;
                         // progress resumes on the next feed (same as a full
                         // data_buf).
+                        self.body_parked = true;
                         return Ok(false);
                     }
                     let _ = self.data_buf.extend_from_slice(&io.recv_buf[..can_store]);
                     io.drain_recv(can_store);
                     let new_remaining = remaining - can_store;
+                    self.body_parked = can_store < to_consume;
 
                     let sid = self.current_stream_id;
                     let _ = self.events.push_back(Http1Event::Data(sid));
@@ -785,6 +817,7 @@ impl<const HDRBUF: usize, const DATABUF: usize> Http1Connection<HDRBUF, DATABUF>
                     }
                     Ok(true)
                 } else {
+                    self.body_parked = true;
                     Ok(false)
                 }
             }
@@ -830,6 +863,7 @@ impl<const HDRBUF: usize, const DATABUF: usize> Http1Connection<HDRBUF, DATABUF>
                 if self.data_buf.buf_try_reserve(n).is_err() {
                     // Allocator pressure: leave the bytes in recv_buf, as for
                     // a full data_buf.
+                    self.body_parked = true;
                     return;
                 }
                 let _ = self.data_buf.extend_from_slice(&io.recv_buf[..n]);
@@ -837,6 +871,7 @@ impl<const HDRBUF: usize, const DATABUF: usize> Http1Connection<HDRBUF, DATABUF>
                 let sid = self.current_stream_id;
                 let _ = self.events.push_back(Http1Event::Data(sid));
             }
+            self.body_parked = !io.recv_buf.is_empty();
         }
     }
 

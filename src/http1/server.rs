@@ -203,6 +203,15 @@ impl<const BUF: usize, const HDRBUF: usize, const DATABUF: usize>
     fn tcp_poll_output<'a>(&mut self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
         Http1Server::poll_output(self, buf)
     }
+
+    fn recv_blocked(&self) -> bool {
+        // Body bytes parked in `recv_buf` for lack of room in `data_buf`:
+        // reading more TCP would only grow `recv_buf` toward its `BUF`
+        // ceiling (and error there), and without a re-drive the parked bytes
+        // never move once the peer has nothing more to send. The runner
+        // re-feeds an empty slice instead, each time the consumer drains.
+        self.inner.body_parked() && !self.io.recv_buf.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -212,6 +221,73 @@ mod tests {
     #[test]
     fn server_creation() {
         let _server = Http1Server::<4096>::new();
+    }
+
+    /// A body larger than `data_buf` parks its tail in `recv_buf`; the
+    /// connection must report receive backpressure until the application has
+    /// drained enough that a re-drive (`feed_data(&[])`) can move the rest.
+    #[test]
+    fn recv_blocked_tracks_parked_body_bytes() {
+        use crate::http::server_conn::HttpServerConn;
+        let mut server = Http1Server::<256, 1024, 8>::new();
+        assert!(!server.recv_blocked());
+        server
+            .feed_data(
+                b"POST /data HTTP/1.1\r\nHost: x\r\nContent-Length: 20\r\n\r\n0123456789abcdefghij",
+            )
+            .unwrap();
+        // 8 bytes fit data_buf; 12 are parked in recv_buf.
+        assert!(server.recv_blocked());
+
+        let mut buf = [0u8; 8];
+        let (n, fin) = server.recv_body(1, &mut buf).unwrap();
+        assert_eq!((n, fin), (8, false));
+        assert_eq!(&buf, b"01234567");
+        // Drained but not yet re-driven: the parked bytes are still waiting
+        // and still need the re-drive, not a TCP read.
+        assert!(server.recv_blocked());
+
+        server.feed_data(b"").unwrap();
+        assert!(server.recv_blocked());
+        let (n, fin) = server.recv_body(1, &mut buf).unwrap();
+        assert_eq!((n, fin), (8, false));
+        assert_eq!(&buf, b"89abcdef");
+        // A partial drain (2 of 8) must keep the parked tail flagged too —
+        // "data_buf full" alone would release the runner here and strand it.
+        server.feed_data(b"").unwrap();
+        // Last 4 bytes moved; nothing parked any more.
+        assert!(!server.recv_blocked());
+        let (n, fin) = server.recv_body(1, &mut buf).unwrap();
+        assert_eq!((n, fin), (4, true));
+        assert_eq!(&buf[..4], b"ghij");
+        assert!(!server.recv_blocked());
+    }
+
+    /// Same for a chunked body, and the network-wait case: an incomplete
+    /// chunk-size line is NOT backpressure (the runner must keep reading).
+    #[test]
+    fn recv_blocked_chunked_body_and_network_wait() {
+        use crate::http::server_conn::HttpServerConn;
+        let mut server = Http1Server::<256, 1024, 8>::new();
+        server
+            .feed_data(b"POST /data HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nc\r\n0123456789ab\r\n")
+            .unwrap();
+        // 8 of the 12 chunk bytes fit; 4 parked.
+        assert!(server.recv_blocked());
+        let mut buf = [0u8; 8];
+        assert_eq!(server.recv_body(1, &mut buf).unwrap(), (8, false));
+        server.feed_data(b"").unwrap();
+        // The tail moved and the chunk's CRLF was consumed; the parser now
+        // waits for the next chunk-size line from the network.
+        assert!(!server.recv_blocked());
+        assert_eq!(server.recv_body(1, &mut buf).unwrap(), (4, false));
+        // A partial size line arrives: still a network wait, not backpressure.
+        server.feed_data(b"4").unwrap();
+        assert!(!server.recv_blocked());
+        server.feed_data(b"\r\nwxyz\r\n0\r\n\r\n").unwrap();
+        assert!(!server.recv_blocked());
+        assert_eq!(server.recv_body(1, &mut buf).unwrap(), (4, true));
+        assert_eq!(&buf[..4], b"wxyz");
     }
 
     #[test]
