@@ -147,6 +147,11 @@ enum H2ConnState {
     Closed,
 }
 
+/// Stack scratch for encoding a HEADERS block (see `send_headers`). Covers
+/// any ordinary request or response header set; larger blocks fall back to
+/// encoding in the send buffer.
+const HEADERS_SCRATCH: usize = 1024;
+
 /// HTTP/2 connection state machine.
 ///
 /// I/O buffers are **not** owned by this struct; callers provide them via
@@ -400,23 +405,51 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                 needed: hdr_start + 9,
             });
         }
-        // The zero-fill below grows send_buf to its full BUF bound for the
-        // HPACK scratch region, so reserve the whole remainder fallibly.
-        io.send_buf.buf_try_reserve(BUF - hdr_start)?;
-        for _ in 0..9 {
-            let _ = io.send_buf.push(0);
-        }
 
-        let encode_start = io.send_buf.len();
-        let max_hpack = BUF - encode_start;
-        while io.send_buf.len() < BUF {
-            let _ = io.send_buf.push(0);
-        }
-        let hpack_len = self.encoder.encode(
-            headers,
-            &mut io.send_buf[encode_start..encode_start + max_hpack],
-        )?;
-        io.send_buf.truncate(encode_start + hpack_len);
+        // Encode the block into a stack scratch first: a response's header
+        // block is a few dozen bytes, and growing the heap-backed send
+        // buffer to its full BUF bound for scratch (the fallback below)
+        // costs a BUF-sized allocation per HEADERS frame — on a
+        // memory-tight target that was the allocation that failed right
+        // after a rejected upload. Only a block that outgrows the scratch
+        // takes the in-place path.
+        let mut scratch = [0u8; HEADERS_SCRATCH];
+        let hpack_len = match self.encoder.encode(headers, &mut scratch) {
+            Ok(n) => {
+                if hdr_start + 9 + n > BUF {
+                    return Err(Error::BufferTooSmall {
+                        needed: hdr_start + 9 + n,
+                    });
+                }
+                io.send_buf.buf_try_reserve(9 + n)?;
+                for _ in 0..9 {
+                    let _ = io.send_buf.push(0);
+                }
+                let _ = io.send_buf.extend_from_slice(&scratch[..n]);
+                n
+            }
+            Err(Error::BufferTooSmall { .. }) => {
+                // The zero-fill below grows send_buf to its full BUF bound
+                // for the HPACK scratch region, so reserve the whole
+                // remainder fallibly.
+                io.send_buf.buf_try_reserve(BUF - hdr_start)?;
+                for _ in 0..9 {
+                    let _ = io.send_buf.push(0);
+                }
+                let encode_start = io.send_buf.len();
+                let max_hpack = BUF - encode_start;
+                while io.send_buf.len() < BUF {
+                    let _ = io.send_buf.push(0);
+                }
+                let n = self.encoder.encode(
+                    headers,
+                    &mut io.send_buf[encode_start..encode_start + max_hpack],
+                )?;
+                io.send_buf.truncate(encode_start + n);
+                n
+            }
+            Err(e) => return Err(e),
+        };
 
         let mut flags = 0u8;
         if end_stream {
@@ -525,7 +558,15 @@ impl<const MAX_STREAMS: usize, const HDRBUF: usize, const DATABUF: usize>
                 needed: io.send_buf.len() + total_needed,
             });
         }
-        io.send_buf.buf_try_reserve(total_needed)?;
+        // A body grows the send buffer to its full bound in one step the
+        // first time it does not fit: amortized doubling from a small
+        // capacity reallocates several times with old and new blocks live
+        // together, a transient peak above the single BUF-sized block
+        // (measured by `h2_tls_peak_heap`). Header-only responses never
+        // reach this and keep their small buffer (see `send_headers`).
+        if io.send_buf.len() + total_needed > io.send_buf.allocated_capacity() {
+            io.send_buf.buf_try_reserve(BUF - io.send_buf.len())?;
+        }
         let flags = if actual_end { FLAG_END_STREAM } else { 0 };
         let hdr = frame::H2FrameHeader {
             length: to_send.len() as u32,

@@ -128,16 +128,25 @@ const CLIENT_BUF: usize = BUF;
 //   one TLS Buf<BUF>             =  18 KB
 //   P + BUF                      ~ 120 KB
 //
-// We set the budget at 112 KB — about 10 KB above the measured peak (slack for
-// Vec-doubling jitter so the test is not flaky) and a clear ~8 KB BELOW P + BUF.
+// We set the budget about 10 KB above the measured peak (slack for
+// Vec-doubling jitter so the test is not flaky) and clearly BELOW P + BUF.
 // A regression reintroducing a fourth per-connection `Buf<BUF>` adds ~18 KB,
-// pushing the peak to ~120 KB > 112 KB and tripping the upper-bound assert.
+// pushing the peak past the budget and tripping the upper-bound assert.
+//
+// Measured peak history (both peers share the allocator, so the client's
+// buffers count too):
+//   - 102 KB with HEADERS growing the send buffer to BUF up front, which put
+//     the CLIENT's send-buffer growth before the window opened;
+//   - 118 KB once HEADERS encodes into a stack scratch and the client's
+//     send buffer grows at its first DATA frame, inside the window. The
+//     server side is unchanged (and a header-only response no longer costs
+//     a BUF-sized allocation at all).
 //
 // The test also asserts the LOWER bound `peak + BUF > budget`: if the real peak
 // ever drifts so far under budget that one extra buffer would NOT breach it,
 // that assert fires telling you to retighten this constant — so the guard can
 // never silently go toothless.
-const SERVER_PEAK_BUDGET: usize = 112 * 1024;
+const SERVER_PEAK_BUDGET: usize = 128 * 1024;
 
 // ===========================================================================
 // Fixtures
@@ -218,13 +227,6 @@ fn server_peak_heap_under_budget_for_large_upload() {
         .send_request("POST", "/system/update", "test.local", &[], false)
         .unwrap();
 
-    // Reset the peak watermark now that the (transient) handshake is done. The
-    // measured window is the steady-state upload + response/teardown — exactly
-    // where per-connection I/O buffers fill and where a regressed 4th buffer
-    // would appear.
-    let baseline = ALLOC.current();
-    ALLOC.reset_peak();
-
     let mut sent = 0usize;
     let mut recv = 0usize;
     let mut to_server: Vec<u8> = Vec::new();
@@ -233,6 +235,13 @@ fn server_peak_heap_under_budget_for_large_upload() {
     let mut sobuf = [0u8; 4096];
     let mut sink = [0u8; 4096];
     let mut guard = 0usize;
+
+    // Reset the peak watermark now that the (transient) handshake is done. The
+    // measured window is the steady-state upload + response/teardown — exactly
+    // where per-connection I/O buffers fill and where a regressed 4th buffer
+    // would appear.
+    let baseline = ALLOC.current();
+    ALLOC.reset_peak();
 
     while recv < BODY_LEN {
         guard += 1;
