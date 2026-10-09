@@ -262,6 +262,7 @@ impl CryptoProvider for Aes128GcmProvider {
 
 #[cfg(feature = "rustcrypto-chacha")]
 /// ChaCha20-Poly1305 cipher suite provider.
+#[derive(Clone, Copy)]
 pub struct ChaCha20Provider;
 
 #[cfg(feature = "rustcrypto-chacha")]
